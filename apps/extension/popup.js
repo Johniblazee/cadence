@@ -22,6 +22,7 @@
         backendUrlInput: document.getElementById("backend-url-input"),
         backendUrlSave: document.getElementById("backend-url-save"),
         clickModeToggle: document.getElementById("click-mode-toggle"),
+        alwaysOnToggle: document.getElementById("always-on-toggle"),
         statusText: document.getElementById("status-text")
     };
 
@@ -128,6 +129,12 @@
                 setStatus(elements.clickModeToggle.checked ? "Click-to-read enabled." : "Click-to-read disabled.");
             }
         });
+
+        elements.alwaysOnToggle.addEventListener("change", async () => {
+            if (await updateSettings({ dockAlwaysOn: elements.alwaysOnToggle.checked })) {
+                setStatus(elements.alwaysOnToggle.checked ? "Cadence will stay on every page." : "Cadence pill hidden on new pages.");
+            }
+        });
     }
 
     async function loadVoices() {
@@ -214,6 +221,7 @@
         setRateUI(state.rate || "+0%");
         elements.backendUrlInput.value = state.backendBaseUrl || "";
         elements.clickModeToggle.checked = Boolean(state.clickMode);
+        elements.alwaysOnToggle.checked = state.dockAlwaysOn !== false;
 
         if (state.lastError) {
             elements.artifactKicker.textContent = "Playback issue";

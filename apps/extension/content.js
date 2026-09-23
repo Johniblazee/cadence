@@ -46,6 +46,7 @@
     const CONTROLLER_PASTE_INPUT_ID = "twelve-reader-controller-paste-input";
     const CONTROLLER_PASTE_READ_ID = "twelve-reader-controller-paste-read";
     const CONTROLLER_PASTE_CLEAR_ID = "twelve-reader-controller-paste-clear";
+    const CONTROLLER_CLICK_MODE_ID = "twelve-reader-controller-click-mode";
 
     const state = {
         clickMode: false,
@@ -62,7 +63,10 @@
         isScrubbing: false,
         scrubRatio: 0,
         // Dock (§2): in-memory only, resets on navigation/reload — no persistence per contract §7.
-        dockCollapsed: false,
+        dockCollapsed: true,
+        dockUserCollapsed: false,
+        dockWasActive: false,
+        dockAlwaysOn: false,
         dockEverShown: false,
         dockDismissed: false,
         dockPasteOpen: false,
@@ -176,11 +180,19 @@
             case "CONTENT_PING":
                 return { ok: true };
 
-            case "SET_CLICK_MODE":
+            case "SET_CLICK_MODE": {
                 state.clickMode = Boolean(message.enabled);
+                if (state.readerState) {
+                    state.readerState.clickMode = state.clickMode;
+                }
+                const clickToggle = document.getElementById(CONTROLLER_CLICK_MODE_ID);
+                if (clickToggle) {
+                    clickToggle.checked = state.clickMode;
+                }
                 updateClickModeMarker();
                 showToast(state.clickMode ? "Cadence click-to-read enabled" : "Cadence click-to-read disabled");
                 return { ok: true };
+            }
 
             case "READER_STATE_UPDATED":
                 applyReaderState(message.state || null);
@@ -229,6 +241,14 @@
 
             case "CONTEXT_MENU_ACTION":
                 await handleContextMenuAction(message);
+                return { ok: true };
+
+            case "SET_DOCK_ALWAYS_ON":
+                state.dockAlwaysOn = Boolean(message.enabled);
+                if (state.readerState) {
+                    state.readerState.dockAlwaysOn = state.dockAlwaysOn;
+                }
+                updateFloatingController(state.readerState);
                 return { ok: true };
 
             default:
@@ -1055,6 +1075,10 @@
     }
 
     function updateFloatingController(readerState) {
+        if (readerState) {
+            state.dockAlwaysOn = Boolean(readerState.dockAlwaysOn);
+        }
+
         const isSpeaking = Boolean(readerState && readerState.isSpeaking);
         const isPaused = Boolean(readerState && readerState.isPaused);
         const isLoading = Boolean(readerState && !isSpeaking && !isPaused && readerState.isActiveTab);
@@ -1065,7 +1089,15 @@
             state.dockDismissed = false;
         }
 
-        const shouldShow = isActiveSession || state.dockPasteOpen || (state.dockEverShown && !state.dockDismissed);
+        if (isActiveSession && !state.dockWasActive && !state.dockUserCollapsed) {
+            state.dockCollapsed = false; // a new session opens the card unless the user collapsed it on this page
+        }
+        if (!isActiveSession && state.dockWasActive && !state.dockPasteOpen) {
+            state.dockCollapsed = true; // back to the standby pill when reading ends
+        }
+        state.dockWasActive = isActiveSession;
+
+        const shouldShow = isActiveSession || state.dockPasteOpen || (!state.dockDismissed && (state.dockAlwaysOn || state.dockEverShown));
         if (!shouldShow) {
             hideFloatingController();
             return;
@@ -1088,8 +1120,10 @@
         subtitle.textContent = getDockSubtitle(readerState, textModel);
         renderControllerVoiceOptions(readerState?.voiceName);
         voice.title = formatVoiceLabel(readerState?.voiceName);
-        void ensureControllerVoices();
         renderSpeedControl(controller, readerState?.rate);
+        controller.querySelector(`#${CONTROLLER_CLICK_MODE_ID}`).checked = readerState
+            ? Boolean(readerState.clickMode)
+            : state.clickMode;
 
         let dockState;
         let statusText;
@@ -1140,6 +1174,9 @@
 
         const pasteOpen = state.dockPasteOpen;
         controller.dataset.mode = pasteOpen ? "paste" : (state.dockCollapsed ? "collapsed" : "expanded");
+        if (controller.dataset.mode === "expanded") {
+            void ensureControllerVoices();
+        }
 
         syncFloatingControllerProgress(readerState);
 
@@ -1651,6 +1688,16 @@
                             <button type="button" class="twelve-reader-controller__speed-btn" data-rate="+50%" aria-pressed="false">1.5×</button>
                         </div>
                     </div>
+                    <div class="twelve-reader-controller__setting twelve-reader-controller__setting--row">
+                        <div class="twelve-reader-controller__setting-text">
+                            <label class="twelve-reader-controller__setting-label" for="${CONTROLLER_CLICK_MODE_ID}">Click to read</label>
+                            <span class="twelve-reader-controller__setting-copy">Start from the sentence you choose.</span>
+                        </div>
+                        <label class="twelve-reader-controller__switch">
+                            <input id="${CONTROLLER_CLICK_MODE_ID}" type="checkbox" role="switch" aria-label="Click to read">
+                            <span class="twelve-reader-controller__switch-ui"></span>
+                        </label>
+                    </div>
                 </div>
                 <button id="${CONTROLLER_PASTE_OPEN_ID}" type="button" class="twelve-reader-controller__paste-open">${controllerIcon("clipboard")}<span>Paste text to read</span></button>
             </div>
@@ -1705,11 +1752,13 @@
 
         controller.querySelector(`#${CONTROLLER_COLLAPSE_ID}`).addEventListener("click", () => {
             state.dockCollapsed = true;
+            state.dockUserCollapsed = true;
             updateFloatingController(state.readerState);
         });
 
         controller.querySelector(`#${CONTROLLER_EXPAND_ID}`).addEventListener("click", () => {
             state.dockCollapsed = false;
+            state.dockUserCollapsed = false;
             updateFloatingController(state.readerState);
         });
 
@@ -1767,6 +1816,11 @@
             await updateFloatingSetting({ voiceName: event.target.value }, `Voice set to ${formatVoiceName(event.target.value)}.`);
         });
 
+        controller.querySelector(`#${CONTROLLER_CLICK_MODE_ID}`).addEventListener("change", async (event) => {
+            // No toast here: the background answers with SET_CLICK_MODE, which already announces the change.
+            await updateFloatingSetting({ clickMode: event.target.checked });
+        });
+
         controller.querySelector(`#${CONTROLLER_PASTE_OPEN_ID}`).addEventListener("click", () => {
             openPastePanel(null);
         });
@@ -1794,7 +1848,6 @@
         });
 
         document.documentElement.appendChild(controller);
-        void ensureControllerVoices();
         return controller;
     }
 
@@ -2212,6 +2265,86 @@
             .twelve-reader-controller__speed-btn[aria-pressed="true"] {
                 background: var(--cd-accent);
                 color: #ffffff;
+            }
+
+            .twelve-reader-controller__setting--row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            }
+
+            .twelve-reader-controller__setting-text {
+                display: grid;
+                gap: 4px;
+                min-width: 0;
+            }
+
+            .twelve-reader-controller__setting-copy {
+                font-size: 12px;
+                line-height: 1.4;
+                color: var(--cd-muted);
+            }
+
+            /* Design-system switch: 54x30 pill, black knob off, accent track + white knob on. */
+            .twelve-reader-controller__switch {
+                position: relative;
+                display: inline-flex;
+                flex-shrink: 0;
+                cursor: pointer;
+            }
+
+            .twelve-reader-controller__switch input {
+                position: absolute;
+                inset: 0;
+                margin: 0;
+                opacity: 0;
+                cursor: pointer;
+            }
+
+            .twelve-reader-controller__switch input:focus-visible {
+                outline: none;
+            }
+
+            .twelve-reader-controller__switch-ui {
+                position: relative;
+                display: inline-flex;
+                width: 54px;
+                height: 30px;
+                border-radius: 999px;
+                border: 1px solid rgba(17, 17, 17, 0.24);
+                background: #ebe8e3;
+                transition: background 160ms ease, border-color 160ms ease;
+            }
+
+            .twelve-reader-controller__switch-ui::after {
+                content: "";
+                position: absolute;
+                top: 3px;
+                left: 3px;
+                width: 22px;
+                height: 22px;
+                border-radius: 999px;
+                background: #111111;
+                transition: transform 160ms ease, background 160ms ease;
+            }
+
+            .twelve-reader-controller__switch input:checked + .twelve-reader-controller__switch-ui {
+                background: var(--cd-accent);
+                border-color: var(--cd-accent-strong);
+            }
+
+            .twelve-reader-controller__switch input:checked + .twelve-reader-controller__switch-ui::after {
+                transform: translateX(24px);
+                background: #ffffff;
+            }
+
+            .twelve-reader-controller__switch input:focus-visible + .twelve-reader-controller__switch-ui {
+                box-shadow: 0 0 0 3px rgba(217, 100, 46, 0.32);
+            }
+
+            .twelve-reader-controller__switch input:disabled + .twelve-reader-controller__switch-ui {
+                opacity: 0.5;
             }
 
             .twelve-reader-controller__paste-open {

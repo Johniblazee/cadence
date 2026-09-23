@@ -7,10 +7,12 @@ const DEFAULT_SETTINGS = {
     backendBaseUrl: DEFAULT_BACKEND_BASE_URL,
     voiceName: "en-US-AriaNeural",
     rate: "+0%",
-    clickMode: false
+    clickMode: false,
+    dockAlwaysOn: true
 };
 const VALID_RATES = new Set(["-25%", "+0%", "+25%", "+50%"]);
 const VALID_SOURCE_KINDS = new Set(["page", "paste", "selection"]);
+const VOICE_CACHE_TTL_MS = 60 * 60 * 1000;
 
 const tabStates = new Map();
 let activeSpeechTabId = null;
@@ -104,8 +106,18 @@ async function handleMessage(message, sender) {
             if (!text.trim()) {
                 throw new Error("Nothing to read.");
             }
+            // Snapshot first: if the backend refuses the new session, the old page session keeps
+            // playing and must keep its own text, source and offset.
+            const prior = await ensureTabState(tabId);
+            const previous = { text: prior.text, sourceKind: prior.sourceKind, currentOffset: prior.currentOffset };
             await setDocumentText(tabId, text, message.source === "selection" ? "selection" : "paste");
-            await startSpeech(tabId, 0, { autoplay: true });
+            try {
+                await startSpeech(tabId, 0, { autoplay: true });
+            } catch (error) {
+                Object.assign(prior, previous);
+                await persistTabState(tabId, prior);
+                throw error;
+            }
             return { state: await getSerializableState(tabId) };
         }
 
@@ -301,6 +313,7 @@ async function getSerializableState(tabId) {
         isSpeaking: state.isSpeaking,
         isPaused: state.isPaused,
         clickMode: state.settings.clickMode,
+        dockAlwaysOn: state.settings.dockAlwaysOn !== false,
         pendingRestart: state.pendingRestart,
         voiceName: state.settings.voiceName,
         rate: state.settings.rate,
@@ -375,6 +388,18 @@ async function updateSettings(tabId, incomingSettings) {
 
     await storageLocalSet(nextSettings);
     state.settings = nextSettings;
+    for (const cached of tabStates.values()) {
+        cached.settings = nextSettings;
+    }
+
+    const changedAlwaysOn = Object.prototype.hasOwnProperty.call(incomingSettings, "dockAlwaysOn");
+    if (changedAlwaysOn) {
+        const tabs = await chrome.tabs.query({});
+        await Promise.all(tabs
+            .filter((tab) => typeof tab.id === "number")
+            .map((tab) => sendOptionalMessageToTab(tab.id, { type: "SET_DOCK_ALWAYS_ON", enabled: nextSettings.dockAlwaysOn })));
+    }
+
     await persistTabState(tabId, state);
 
     const changedClickMode = Object.prototype.hasOwnProperty.call(incomingSettings, "clickMode");
@@ -823,7 +848,23 @@ async function getOffscreenState() {
 
 async function fetchBackendVoices() {
     const settings = await storageLocalGet(DEFAULT_SETTINGS);
-    return fetchBackendJson("/api/voices", {}, settings.backendBaseUrl);
+    const backendBaseUrl = settings.backendBaseUrl;
+
+    const cached = await storageLocalGet({ voiceCache: null });
+    const voiceCache = cached.voiceCache;
+    if (
+        voiceCache &&
+        voiceCache.backendBaseUrl === backendBaseUrl &&
+        Date.now() - voiceCache.fetchedAt < VOICE_CACHE_TTL_MS
+    ) {
+        return voiceCache.voices;
+    }
+
+    const voices = await fetchBackendJson("/api/voices", {}, backendBaseUrl);
+    await storageLocalSet({
+        voiceCache: { backendBaseUrl, fetchedAt: Date.now(), voices }
+    });
+    return voices;
 }
 
 
@@ -1050,6 +1091,10 @@ function sanitizeSettings(settings) {
 
     if (Object.prototype.hasOwnProperty.call(settings, "clickMode")) {
         next.clickMode = Boolean(settings.clickMode);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(settings, "dockAlwaysOn")) {
+        next.dockAlwaysOn = Boolean(settings.dockAlwaysOn);
     }
 
     return next;
