@@ -192,14 +192,27 @@ async function handleCommand(command) {
         return;
     }
 
-    if (command === "read-from-top") {
-        await refreshDocumentText(tab.id);
-        await startSpeech(tab.id, 0, { autoplay: true });
-        return;
-    }
+    try {
+        if (command === "read-from-top") {
+            await refreshDocumentText(tab.id);
+            await startSpeech(tab.id, 0, { autoplay: true });
+            return;
+        }
 
-    if (command === "toggle-playback") {
-        await togglePlayback(tab.id);
+        if (command === "toggle-playback") {
+            await togglePlayback(tab.id);
+        }
+    } catch (error) {
+        if (error.code !== "PAGE_NOT_SUPPORTED") {
+            throw error;
+        }
+
+        // A shortcut on a page Cadence cannot read is not an error worth a red badge;
+        // remember it so the popup can explain if the user opens it.
+        console.warn(`Cadence: ${error.message}`);
+        const state = await ensureTabState(tab.id);
+        state.lastError = error.message;
+        await persistTabState(tab.id, state);
     }
 }
 
@@ -277,7 +290,7 @@ async function ensureContentScriptReady(tabId) {
 
     const tab = await chrome.tabs.get(tabId);
     if (!isInjectableTab(tab)) {
-        throw new Error("Cadence cannot run on this page.");
+        throw pageNotSupportedError("Cadence cannot run on this page.");
     }
 
     await chrome.scripting.executeScript({
@@ -287,7 +300,7 @@ async function ensureContentScriptReady(tabId) {
 
     const injected = await sendOptionalMessageToTab(tabId, { type: "CONTENT_PING" });
     if (!injected || !injected.ok) {
-        throw new Error("Cadence could not attach to this page.");
+        throw pageNotSupportedError("Cadence could not attach to this page.");
     }
 }
 
@@ -298,6 +311,14 @@ function isInjectableTab(tab) {
     }
 
     return /^https?:\/\//.test(tab.url) || /^file:\/\//.test(tab.url);
+}
+
+
+// An expected condition (chrome://, new tab, Web Store, PDF viewer), not an extension failure.
+function pageNotSupportedError(message) {
+    const error = new Error(message);
+    error.code = "PAGE_NOT_SUPPORTED";
+    return error;
 }
 
 
