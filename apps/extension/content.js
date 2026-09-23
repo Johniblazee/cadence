@@ -13,10 +13,10 @@
     const LAYOUT_SKIP_TAGS = new Set(["HEADER", "NAV", "FOOTER", "ASIDE"]);
     const RATE_STEPS = ["-25%", "+0%", "+25%", "+50%"];
     const RATE_LABELS = {
-        "-25%": "0.75x",
-        "+0%": "1.0x",
-        "+25%": "1.25x",
-        "+50%": "1.5x"
+        "-25%": "0.75×",
+        "+0%": "1.0×",
+        "+25%": "1.25×",
+        "+50%": "1.5×"
     };
     const OVERLAY_ID = "twelve-reader-overlay";
     const STYLE_ID = "twelve-reader-style";
@@ -36,7 +36,16 @@
     const CONTROLLER_TOGGLE_ID = "twelve-reader-controller-toggle";
     const CONTROLLER_NEXT_ID = "twelve-reader-controller-next";
     const CONTROLLER_FORWARD_ID = "twelve-reader-controller-forward";
-    const CONTROLLER_STOP_ID = "twelve-reader-controller-stop";
+    const CONTROLLER_COLLAPSE_ID = "twelve-reader-controller-collapse";
+    const CONTROLLER_EXPAND_ID = "twelve-reader-controller-expand";
+    const CONTROLLER_PILL_TOGGLE_ID = "twelve-reader-controller-pill-toggle";
+    const CONTROLLER_PILL_LABEL_ID = "twelve-reader-controller-pill-label";
+    const CONTROLLER_PILL_RING_ID = "twelve-reader-controller-pill-ring";
+    const CONTROLLER_PASTE_OPEN_ID = "twelve-reader-controller-paste-open";
+    const CONTROLLER_PASTE_CLOSE_ID = "twelve-reader-controller-paste-close";
+    const CONTROLLER_PASTE_INPUT_ID = "twelve-reader-controller-paste-input";
+    const CONTROLLER_PASTE_READ_ID = "twelve-reader-controller-paste-read";
+    const CONTROLLER_PASTE_CLEAR_ID = "twelve-reader-controller-paste-clear";
 
     const state = {
         clickMode: false,
@@ -51,7 +60,15 @@
         mutationObserver: null,
         resizeScheduled: false,
         isScrubbing: false,
-        scrubRatio: 0
+        scrubRatio: 0,
+        // Dock (§2): in-memory only, resets on navigation/reload — no persistence per contract §7.
+        dockCollapsed: false,
+        dockEverShown: false,
+        dockDismissed: false,
+        dockPasteOpen: false,
+        externalText: null,
+        externalModel: null,
+        lastContextPoint: null
     };
 
     injectStyles();
@@ -82,6 +99,9 @@
 
         document.addEventListener("click", onDocumentClick, true);
         document.addEventListener("keydown", onDocumentKeyDown, true);
+        document.addEventListener("contextmenu", (event) => {
+            state.lastContextPoint = { x: event.clientX, y: event.clientY, target: event.target };
+        }, true);
         window.addEventListener("scroll", scheduleHighlightRedraw, { passive: true });
         window.addEventListener("resize", scheduleHighlightRedraw, { passive: true });
     }
@@ -166,26 +186,36 @@
                 applyReaderState(message.state || null);
                 return { ok: true };
 
-            case "READER_STARTED":
-                buildOrReuseReadingMap();
+            case "READER_STARTED": {
+                const isPageSource = !state.readerState?.sourceKind || state.readerState.sourceKind === "page";
+                if (isPageSource) {
+                    buildOrReuseReadingMap();
+                } else {
+                    clearHighlights();
+                }
                 if (state.readerState) {
                     state.readerState.currentOffset = Number(message.startOffset) || 0;
                     syncFloatingControllerProgress(state.readerState);
                 }
                 return { ok: true };
+            }
 
-            case "READING_PROGRESS":
-                buildOrReuseReadingMap();
-                if (!highlightOffset(message.absoluteOffset || 0)) {
-                    state.dirty = true;
+            case "READING_PROGRESS": {
+                const isPageSource = !state.readerState?.sourceKind || state.readerState.sourceKind === "page";
+                if (isPageSource) {
                     buildOrReuseReadingMap();
-                    highlightOffset(message.absoluteOffset || 0);
+                    if (!highlightOffset(message.absoluteOffset || 0)) {
+                        state.dirty = true;
+                        buildOrReuseReadingMap();
+                        highlightOffset(message.absoluteOffset || 0);
+                    }
                 }
                 if (state.readerState) {
                     state.readerState.currentOffset = message.resumeOffset || message.absoluteOffset || 0;
                     syncFloatingControllerProgress(state.readerState);
                 }
                 return { ok: true };
+            }
 
             case "READING_DONE":
                 scheduleHighlightRedraw();
@@ -195,6 +225,10 @@
             case "CLEAR_READER":
                 clearHighlights();
                 hideFloatingController();
+                return { ok: true };
+
+            case "CONTEXT_MENU_ACTION":
+                await handleContextMenuAction(message);
                 return { ok: true };
 
             default:
@@ -254,6 +288,85 @@
             }
         } catch (error) {
             showToast(error.message || "Cadence could not start reading here.");
+        }
+    }
+
+    // Reuses the onDocumentClick PAGE_CLICK_READING_REQUEST pattern, but sourced from the
+    // last right-click point (§4) instead of a click event, and applies the returned state directly.
+    async function readFromContextPoint() {
+        const point = state.lastContextPoint;
+        const readingMap = buildOrReuseReadingMap();
+        const offset = point?.target ? getOffsetFromPoint(point.x, point.y, point.target, readingMap) : null;
+        if (offset == null) {
+            showToast("Right-click on some text first.");
+            return;
+        }
+
+        try {
+            const response = await chrome.runtime.sendMessage({
+                type: "PAGE_CLICK_READING_REQUEST",
+                offset,
+                text: readingMap.text
+            });
+            if (!response || !response.ok) {
+                throw new Error(response?.error || "Could not start webpage reading.");
+            }
+            if (response.state) {
+                applyReaderState(response.state);
+            }
+        } catch (error) {
+            showToast(error.message || "Cadence could not start reading here.");
+        }
+    }
+
+    async function handleContextMenuAction(message) {
+        const action = message.action;
+
+        if (action === "read-from-here") {
+            await readFromContextPoint();
+            return;
+        }
+
+        if (action === "continue-from-here") {
+            const readerState = state.readerState;
+            const isPageSession = Boolean(
+                readerState
+                && (readerState.isSpeaking || readerState.isPaused)
+                && (!readerState.sourceKind || readerState.sourceKind === "page")
+            );
+            if (!isPageSession) {
+                await readFromContextPoint();
+                return;
+            }
+
+            const point = state.lastContextPoint;
+            const readingMap = buildOrReuseReadingMap();
+            const offset = point?.target ? getOffsetFromPoint(point.x, point.y, point.target, readingMap) : null;
+            if (offset == null) {
+                showToast("Right-click on some text first.");
+                return;
+            }
+            await requestFloatingSeek(offset, { autoplay: true });
+            return;
+        }
+
+        if (action === "read-selection") {
+            const text = (window.getSelection()?.toString() || message.selectionText || "").trim();
+            if (!text) {
+                showToast("Select some text first.");
+                return;
+            }
+            await sendReadTextAction(text, "selection");
+            return;
+        }
+
+        if (action === "send-to-paste") {
+            const text = (window.getSelection()?.toString() || message.selectionText || "").trim();
+            if (!text) {
+                showToast("Select some text first.");
+                return;
+            }
+            openPastePanel(text);
         }
     }
 
@@ -860,70 +973,177 @@
 
     function applyReaderState(readerState) {
         const previousBackendBaseUrl = state.readerState?.backendBaseUrl || "";
+        const previousSourceKind = state.readerState?.sourceKind || "page";
         state.readerState = readerState || null;
         if (readerState && previousBackendBaseUrl !== (readerState.backendBaseUrl || "")) {
             state.availableVoices = [];
             state.voicesPromise = null;
             state.voiceLoadErrorShown = false;
         }
+        const nextSourceKind = readerState?.sourceKind || "page";
+        if (nextSourceKind !== "page" && nextSourceKind !== previousSourceKind) {
+            // ponytail: guard against stale page highlights lingering under a paste/selection read
+            clearHighlights();
+        }
         updateFloatingController(readerState || null);
     }
 
+    // ponytail: sentence index instead of paragraph index; sentence ranges already exist, paragraph mapping does not
+    function getActiveTextModel() {
+        const readerState = state.readerState;
+        if (!readerState || !readerState.sourceKind || readerState.sourceKind === "page") {
+            const readingMap = buildOrReuseReadingMap();
+            return {
+                isPage: true,
+                text: readingMap.text,
+                textLength: readingMap.text.length,
+                wordCount: readingMap.wordCount,
+                sentenceRanges: readingMap.sentenceRanges
+            };
+        }
+
+        if (state.externalText) {
+            if (!state.externalModel || state.externalModel.text !== state.externalText) {
+                state.externalModel = {
+                    text: state.externalText,
+                    textLength: state.externalText.length,
+                    wordCount: countWords(state.externalText),
+                    sentenceRanges: buildSentenceRanges(state.externalText)
+                };
+            }
+            return { isPage: false, ...state.externalModel };
+        }
+
+        // ponytail: rough word estimate when the pasted text is not available locally (content script reloaded mid paste-read)
+        const textLength = readerState.textLength || 0;
+        return {
+            isPage: false,
+            text: "",
+            textLength,
+            wordCount: Math.round(textLength / 5.5),
+            sentenceRanges: []
+        };
+    }
+
+    function getDockTitle(sourceKind) {
+        if (sourceKind === "paste") {
+            return "Pasted text";
+        }
+        if (sourceKind === "selection") {
+            return "Selected text";
+        }
+        return getControllerTitle();
+    }
+
+    function getDockSubtitle(readerState, textModel) {
+        const voiceLabel = formatVoiceName(readerState?.voiceName);
+        if (!textModel.sentenceRanges.length) {
+            return voiceLabel;
+        }
+
+        const currentOffset = clamp(Number(readerState?.currentOffset) || 0, 0, textModel.textLength);
+        const index = findSentenceIndexForOffset(currentOffset, textModel.sentenceRanges);
+        const sentenceNumber = index >= 0 ? index + 1 : 1;
+        return `Sentence ${sentenceNumber} of ${textModel.sentenceRanges.length} · ${voiceLabel}`;
+    }
+
+    function renderSpeedControl(controller, rate) {
+        const activeRate = RATE_STEPS.includes(rate) ? rate : "+0%";
+        controller.querySelectorAll(`#${CONTROLLER_SPEED_ID} [data-rate]`).forEach((button) => {
+            button.setAttribute("aria-pressed", button.dataset.rate === activeRate ? "true" : "false");
+        });
+    }
+
     function updateFloatingController(readerState) {
-        const shouldShow = Boolean(readerState && (readerState.isSpeaking || readerState.isPaused || readerState.isActiveTab));
+        const isSpeaking = Boolean(readerState && readerState.isSpeaking);
+        const isPaused = Boolean(readerState && readerState.isPaused);
+        const isLoading = Boolean(readerState && !isSpeaking && !isPaused && readerState.isActiveTab);
+        const isActiveSession = isSpeaking || isPaused || isLoading;
+
+        if (isActiveSession) {
+            state.dockEverShown = true;
+            state.dockDismissed = false;
+        }
+
+        const shouldShow = isActiveSession || state.dockPasteOpen || (state.dockEverShown && !state.dockDismissed);
         if (!shouldShow) {
             hideFloatingController();
             return;
         }
 
         const controller = ensureFloatingController();
-        const readingMap = buildOrReuseReadingMap();
+        const textModel = getActiveTextModel();
+        const sourceKind = readerState?.sourceKind || "page";
+        const navigationDisabled = textModel.textLength === 0;
+
         const title = controller.querySelector(`#${CONTROLLER_TITLE_ID}`);
         const subtitle = controller.querySelector(`#${CONTROLLER_SUBTITLE_ID}`);
         const status = controller.querySelector(`#${CONTROLLER_STATUS_ID}`);
-        const speed = controller.querySelector(`#${CONTROLLER_SPEED_ID}`);
         const voice = controller.querySelector(`#${CONTROLLER_VOICE_ID}`);
         const seekInput = controller.querySelector(`#${CONTROLLER_SEEK_ID}`);
         const toggleButton = controller.querySelector(`#${CONTROLLER_TOGGLE_ID}`);
-        const navigationDisabled = !readingMap.text.trim();
 
-        title.textContent = getControllerTitle();
+        title.textContent = getDockTitle(sourceKind);
         title.title = title.textContent;
-        subtitle.textContent = `Narrator: ${formatVoiceName(readerState.voiceName).toUpperCase()}`;
-        speed.value = RATE_STEPS.includes(readerState.rate) ? readerState.rate : "+0%";
-        speed.title = formatRateLabel(readerState.rate);
-        renderControllerVoiceOptions(readerState.voiceName);
-        voice.title = formatVoiceLabel(readerState.voiceName);
+        subtitle.textContent = getDockSubtitle(readerState, textModel);
+        renderControllerVoiceOptions(readerState?.voiceName);
+        voice.title = formatVoiceLabel(readerState?.voiceName);
         void ensureControllerVoices();
+        renderSpeedControl(controller, readerState?.rate);
 
-        if (readerState.isSpeaking) {
-            status.textContent = "Reading aloud";
-            toggleButton.innerHTML = controllerIcon("pause");
-            toggleButton.disabled = false;
-            controller.dataset.state = "reading";
-        } else if (readerState.isPaused) {
-            status.textContent = "Paused";
-            toggleButton.innerHTML = controllerIcon("play");
-            toggleButton.disabled = false;
-            controller.dataset.state = "paused";
+        let dockState;
+        let statusText;
+        let toggleIcon;
+        let toggleLabel;
+        let toggleExtraDisabled = false;
+
+        if (isSpeaking) {
+            dockState = "reading";
+            statusText = "Reading";
+            toggleIcon = "pause";
+            toggleLabel = "Pause playback";
+        } else if (isPaused) {
+            dockState = "paused";
+            statusText = "Paused";
+            toggleIcon = "play";
+            toggleLabel = "Resume playback";
+        } else if (isLoading) {
+            dockState = "loading";
+            statusText = "Preparing";
+            toggleIcon = "pause";
+            toggleLabel = "Pause playback";
+            toggleExtraDisabled = true;
         } else {
-            status.textContent = "Preparing audio";
-            toggleButton.innerHTML = controllerIcon("pause");
-            toggleButton.disabled = true;
-            controller.dataset.state = "loading";
+            dockState = "idle";
+            statusText = "Ready";
+            toggleIcon = "play";
+            toggleLabel = "Start reading";
         }
 
-        toggleButton.setAttribute("aria-label", readerState.isPaused ? "Resume playback" : "Pause playback");
-        seekInput.disabled = navigationDisabled;
-        controller.querySelector(`#${CONTROLLER_REWIND_ID}`).disabled = navigationDisabled;
-        controller.querySelector(`#${CONTROLLER_PREVIOUS_ID}`).disabled = navigationDisabled;
-        controller.querySelector(`#${CONTROLLER_NEXT_ID}`).disabled = navigationDisabled;
-        controller.querySelector(`#${CONTROLLER_FORWARD_ID}`).disabled = navigationDisabled;
+        controller.dataset.state = dockState;
+        // Idle: seeking is meaningless, but play (main button and pill button) starts reading from the top.
+        const transportDisabled = dockState === "idle" ? true : navigationDisabled;
+        const pillToggle = controller.querySelector(`#${CONTROLLER_PILL_TOGGLE_ID}`);
+
+        status.textContent = statusText;
+        toggleButton.innerHTML = controllerIcon(toggleIcon);
+        toggleButton.disabled = navigationDisabled || toggleExtraDisabled;
+        toggleButton.setAttribute("aria-label", toggleLabel);
+        pillToggle.innerHTML = controllerIcon(toggleIcon);
+        pillToggle.disabled = navigationDisabled || toggleExtraDisabled;
+        pillToggle.setAttribute("aria-label", toggleLabel);
+        seekInput.disabled = transportDisabled;
+        controller.querySelector(`#${CONTROLLER_REWIND_ID}`).disabled = transportDisabled;
+        controller.querySelector(`#${CONTROLLER_PREVIOUS_ID}`).disabled = transportDisabled;
+        controller.querySelector(`#${CONTROLLER_NEXT_ID}`).disabled = transportDisabled;
+        controller.querySelector(`#${CONTROLLER_FORWARD_ID}`).disabled = transportDisabled;
+
+        const pasteOpen = state.dockPasteOpen;
+        controller.dataset.mode = pasteOpen ? "paste" : (state.dockCollapsed ? "collapsed" : "expanded");
 
         syncFloatingControllerProgress(readerState);
 
         controller.hidden = false;
-        controller.dataset.visible = "true";
     }
 
     function hideFloatingController() {
@@ -934,7 +1154,6 @@
 
         state.isScrubbing = false;
         controller.hidden = true;
-        controller.dataset.visible = "false";
     }
 
     function syncFloatingControllerProgress(readerState) {
@@ -943,17 +1162,19 @@
             return;
         }
 
-        const readingMap = buildOrReuseReadingMap();
+        const textModel = getActiveTextModel();
         const seekInput = controller.querySelector(`#${CONTROLLER_SEEK_ID}`);
         const currentTime = controller.querySelector(`#${CONTROLLER_CURRENT_TIME_ID}`);
         const totalTime = controller.querySelector(`#${CONTROLLER_TOTAL_TIME_ID}`);
-        const totalLength = readingMap.text.length;
+        const pillRing = controller.querySelector(`#${CONTROLLER_PILL_RING_ID}`);
+        const pillLabel = controller.querySelector(`#${CONTROLLER_PILL_LABEL_ID}`);
+        const totalLength = textModel.textLength;
         const liveOffset = clamp(Number(readerState.currentOffset) || 0, 0, totalLength);
         const displayOffset = state.isScrubbing
             ? offsetFromProgressRatio(totalLength, state.scrubRatio)
             : liveOffset;
         const progressRatio = totalLength > 0 ? displayOffset / totalLength : 0;
-        const totalSeconds = estimateTotalDurationSeconds(readingMap, readerState.rate);
+        const totalSeconds = estimateTotalDurationSeconds(textModel, readerState.rate);
         const currentSeconds = totalSeconds * progressRatio;
 
         if (!state.isScrubbing) {
@@ -963,6 +1184,15 @@
         paintSeekTrack(seekInput, progressRatio);
         currentTime.textContent = formatClockLabel(currentSeconds);
         totalTime.textContent = formatClockLabel(totalSeconds);
+
+        const isIdle = controller.dataset.state === "idle";
+        const ringPercent = isIdle ? "0%" : `${Math.round(progressRatio * 100)}%`;
+        if (pillRing) {
+            pillRing.style.setProperty("--cd-ring", ringPercent);
+        }
+        if (pillLabel) {
+            pillLabel.textContent = isIdle ? "Cadence" : formatClockLabel(currentSeconds);
+        }
     }
 
     async function ensureControllerVoices() {
@@ -1060,8 +1290,8 @@
             return;
         }
 
-        const readingMap = buildOrReuseReadingMap();
-        const targetOffset = offsetFromProgressRatio(readingMap.text.length, state.scrubRatio);
+        const textModel = getActiveTextModel();
+        const targetOffset = offsetFromProgressRatio(textModel.textLength, state.scrubRatio);
         state.isScrubbing = false;
         await requestFloatingSeek(targetOffset, { autoplay: state.readerState.isSpeaking });
     }
@@ -1071,16 +1301,16 @@
             return;
         }
 
-        const readingMap = buildOrReuseReadingMap();
-        const totalSeconds = estimateTotalDurationSeconds(readingMap, state.readerState.rate);
-        if (!readingMap.text.length || !totalSeconds) {
+        const textModel = getActiveTextModel();
+        const totalSeconds = estimateTotalDurationSeconds(textModel, state.readerState.rate);
+        if (!textModel.textLength || !totalSeconds) {
             return;
         }
 
-        const currentOffset = clamp(Number(state.readerState.currentOffset) || 0, 0, readingMap.text.length);
-        const currentSeconds = totalSeconds * (currentOffset / readingMap.text.length);
+        const currentOffset = clamp(Number(state.readerState.currentOffset) || 0, 0, textModel.textLength);
+        const currentSeconds = totalSeconds * (currentOffset / textModel.textLength);
         const targetSeconds = clamp(currentSeconds + deltaSeconds, 0, totalSeconds);
-        const targetOffset = offsetFromProgressRatio(readingMap.text.length, targetSeconds / totalSeconds);
+        const targetOffset = offsetFromProgressRatio(textModel.textLength, targetSeconds / totalSeconds);
         await requestFloatingSeek(targetOffset, { autoplay: state.readerState.isSpeaking });
     }
 
@@ -1089,13 +1319,13 @@
             return;
         }
 
-        const readingMap = buildOrReuseReadingMap();
-        const sentenceRanges = readingMap.sentenceRanges;
+        const textModel = getActiveTextModel();
+        const sentenceRanges = textModel.sentenceRanges;
         if (!sentenceRanges.length) {
             return;
         }
 
-        const currentOffset = clamp(Number(state.readerState.currentOffset) || 0, 0, readingMap.text.length);
+        const currentOffset = clamp(Number(state.readerState.currentOffset) || 0, 0, textModel.textLength);
         const currentIndex = findSentenceIndexForOffset(currentOffset, sentenceRanges);
         if (currentIndex < 0) {
             return;
@@ -1119,15 +1349,19 @@
             return;
         }
 
-        const readingMap = buildOrReuseReadingMap();
-        const normalizedOffset = snapSeekOffset(readingMap.text, targetOffset);
+        const textModel = getActiveTextModel();
+        const normalizedOffset = textModel.text
+            ? snapSeekOffset(textModel.text, targetOffset)
+            : clamp(Number(targetOffset) || 0, 0, textModel.textLength);
         const autoplay = typeof options.autoplay === "boolean"
             ? options.autoplay
             : state.readerState.isSpeaking;
 
         state.readerState.currentOffset = normalizedOffset;
         syncFloatingControllerProgress(state.readerState);
-        highlightOffset(normalizedOffset);
+        if (textModel.isPage) {
+            highlightOffset(normalizedOffset);
+        }
 
         try {
             const response = await chrome.runtime.sendMessage({
@@ -1258,7 +1492,7 @@
     }
 
     function formatRateLabel(rate) {
-        return RATE_LABELS[rate] || "1.0x";
+        return RATE_LABELS[rate] || "1.0×";
     }
 
     function formatVoiceName(voiceName) {
@@ -1292,10 +1526,77 @@
             next: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 6h2v12h-2zM6 6l10 6-10 6z"></path></svg>',
             rewind: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5a7 7 0 1 0 6.6 9.3h-2.2A5 5 0 1 1 12 7h1.8L11 9.8 12.4 11 18 5.4 12.4-.2 11 1.2 13.8 4H12z"></path><text x="12" y="18" text-anchor="middle" font-size="6" font-family="Arial, sans-serif">15</text></svg>',
             forward: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5a7 7 0 1 1-6.6 9.3h2.2A5 5 0 1 0 12 7h-1.8L13 9.8 11.6 11 6 5.4 11.6-.2 13 1.2 10.2 4H12z"></path><text x="12" y="18" text-anchor="middle" font-size="6" font-family="Arial, sans-serif">15</text></svg>',
-            stop: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v10H7z"></path></svg>'
+            chevronUp: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 14l6-6 6 6z"></path></svg>',
+            chevronDown: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 10l6 6 6-6z"></path></svg>',
+            clipboard: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2m2-2h4v4h-4z"></path></svg>'
         };
 
         return icons[name] || "";
+    }
+
+    async function handleTogglePlayback() {
+        try {
+            const response = await chrome.runtime.sendMessage({ type: "FLOATING_TOGGLE_PLAYBACK" });
+            if (!response || !response.ok) {
+                throw new Error(response?.error || "Playback control failed.");
+            }
+            if (response.state) {
+                applyReaderState(response.state);
+            }
+        } catch (error) {
+            showToast(error.message || "Playback control failed.");
+        }
+    }
+
+    async function handleStartReadingTop() {
+        try {
+            const response = await chrome.runtime.sendMessage({ type: "START_READING_TOP" });
+            if (!response || !response.ok) {
+                throw new Error(response?.error || "Could not start reading.");
+            }
+            if (response.state) {
+                applyReaderState(response.state);
+            }
+        } catch (error) {
+            showToast(error.message || "Could not start reading.");
+        }
+    }
+
+    // Shared by "Read selection only" and the paste panel's "Read this text" (§4/§5 READ_TEXT).
+    async function sendReadTextAction(text, source) {
+        state.externalText = text;
+        try {
+            const response = await chrome.runtime.sendMessage({ type: "READ_TEXT", text, source });
+            if (!response || !response.ok) {
+                throw new Error(response?.error || "Could not read this text.");
+            }
+            state.dockCollapsed = false;
+            state.dockPasteOpen = false;
+            if (response.state) {
+                applyReaderState(response.state);
+            } else {
+                updateFloatingController(state.readerState);
+            }
+            return true;
+        } catch (error) {
+            showToast(error.message || "Could not read this text.");
+            return false;
+        }
+    }
+
+    // Opens the paste panel; when `text` is given it is appended to any existing draft (§4 send-to-paste).
+    function openPastePanel(text) {
+        const controller = ensureFloatingController();
+        if (text) {
+            const textarea = controller.querySelector(`#${CONTROLLER_PASTE_INPUT_ID}`);
+            textarea.value = textarea.value.trim() ? `${textarea.value}\n\n${text}` : text;
+        }
+        state.dockPasteOpen = true;
+        state.dockCollapsed = false;
+        state.dockDismissed = false;
+        state.dockEverShown = true;
+        updateFloatingController(state.readerState);
+        controller.querySelector(`#${CONTROLLER_PASTE_INPUT_ID}`).focus();
     }
 
     function ensureFloatingController() {
@@ -1307,98 +1608,109 @@
         controller = document.createElement("div");
         controller.id = CONTROLLER_ID;
         controller.hidden = true;
-        controller.dataset.visible = "false";
+        controller.dataset.mode = "expanded";
+        controller.dataset.state = "idle";
         controller.innerHTML = `
-            <button id="${CONTROLLER_CLOSE_ID}" type="button" class="twelve-reader-controller__close" aria-label="Close reader">&times;</button>
-            <div class="twelve-reader-controller__artifact">
-                <div class="twelve-reader-controller__cover" aria-hidden="true">
-                    <span></span>
-                    <span></span>
-                    <span></span>
-                    <span></span>
-                </div>
-                <div class="twelve-reader-controller__meta">
-                    <span id="${CONTROLLER_TITLE_ID}" class="twelve-reader-controller__title">Current page</span>
-                    <span id="${CONTROLLER_SUBTITLE_ID}" class="twelve-reader-controller__subtitle">Narrator: DEFAULT VOICE</span>
-                    <span id="${CONTROLLER_STATUS_ID}" class="twelve-reader-controller__sr-only" aria-live="polite">Preparing audio</span>
+            <div class="twelve-reader-controller__header">
+                <span id="${CONTROLLER_STATUS_ID}" class="twelve-reader-controller__status" aria-live="polite">Ready</span>
+                <div class="twelve-reader-controller__header-actions">
+                    <button id="${CONTROLLER_COLLAPSE_ID}" type="button" class="twelve-reader-controller__header-btn" aria-label="Collapse Cadence">${controllerIcon("chevronUp")}</button>
+                    <button id="${CONTROLLER_CLOSE_ID}" type="button" class="twelve-reader-controller__header-btn" aria-label="Close Cadence">&times;</button>
                 </div>
             </div>
-            <div class="twelve-reader-controller__transport">
-                <div class="twelve-reader-controller__actions">
+            <div class="twelve-reader-controller__body">
+                <div class="twelve-reader-controller__meta">
+                    <span id="${CONTROLLER_TITLE_ID}" class="twelve-reader-controller__title">Current page</span>
+                    <span id="${CONTROLLER_SUBTITLE_ID}" class="twelve-reader-controller__subtitle">Default voice</span>
+                </div>
+                <div class="twelve-reader-controller__transport-row">
                     <button id="${CONTROLLER_REWIND_ID}" type="button" class="twelve-reader-controller__icon-button" aria-label="Jump back 15 seconds" data-control-action="rewind">${controllerIcon("rewind")}</button>
                     <button id="${CONTROLLER_PREVIOUS_ID}" type="button" class="twelve-reader-controller__icon-button" aria-label="Previous sentence" data-control-action="previous">${controllerIcon("previous")}</button>
                     <button id="${CONTROLLER_TOGGLE_ID}" type="button" class="twelve-reader-controller__play-button" aria-label="Pause playback">${controllerIcon("pause")}</button>
                     <button id="${CONTROLLER_NEXT_ID}" type="button" class="twelve-reader-controller__icon-button" aria-label="Next sentence" data-control-action="next">${controllerIcon("next")}</button>
                     <button id="${CONTROLLER_FORWARD_ID}" type="button" class="twelve-reader-controller__icon-button" aria-label="Jump forward 15 seconds" data-control-action="forward">${controllerIcon("forward")}</button>
-                    <button id="${CONTROLLER_STOP_ID}" type="button" class="twelve-reader-controller__icon-button" aria-label="Stop reading" data-control-action="stop">${controllerIcon("stop")}</button>
                 </div>
                 <div class="twelve-reader-controller__timeline">
                     <span id="${CONTROLLER_CURRENT_TIME_ID}" class="twelve-reader-controller__time">0:00</span>
                     <input id="${CONTROLLER_SEEK_ID}" class="twelve-reader-controller__seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Seek reading position">
                     <span id="${CONTROLLER_TOTAL_TIME_ID}" class="twelve-reader-controller__time">0:00</span>
                 </div>
-            </div>
-            <div class="twelve-reader-controller__settings">
-                <div class="twelve-reader-controller__setting">
-                    <label class="twelve-reader-controller__setting-label" for="${CONTROLLER_SPEED_ID}">Speed</label>
-                    <div class="twelve-reader-controller__setting-input-wrap">
-                        <select id="${CONTROLLER_SPEED_ID}" class="twelve-reader-controller__setting-select">
-                            <option value="-25%">0.75x</option>
-                            <option value="+0%" selected>1.0x</option>
-                            <option value="+25%">1.25x</option>
-                            <option value="+50%">1.5x</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="twelve-reader-controller__setting">
-                    <label class="twelve-reader-controller__setting-label" for="${CONTROLLER_VOICE_ID}">Voice</label>
-                    <div class="twelve-reader-controller__setting-input-wrap twelve-reader-controller__setting-input-wrap--voice">
-                        <select id="${CONTROLLER_VOICE_ID}" class="twelve-reader-controller__setting-select twelve-reader-controller__setting-select--voice" disabled>
+                <div class="twelve-reader-controller__settings">
+                    <div class="twelve-reader-controller__setting">
+                        <label class="twelve-reader-controller__setting-label" for="${CONTROLLER_VOICE_ID}">Voice</label>
+                        <select id="${CONTROLLER_VOICE_ID}" class="twelve-reader-controller__voice-select" disabled>
                             <option>Loading voices...</option>
                         </select>
                     </div>
+                    <div class="twelve-reader-controller__setting">
+                        <span class="twelve-reader-controller__setting-label">Speed</span>
+                        <div id="${CONTROLLER_SPEED_ID}" class="twelve-reader-controller__speed" role="group" aria-label="Playback speed">
+                            <button type="button" class="twelve-reader-controller__speed-btn" data-rate="-25%" aria-pressed="false">0.75×</button>
+                            <button type="button" class="twelve-reader-controller__speed-btn" data-rate="+0%" aria-pressed="true">1.0×</button>
+                            <button type="button" class="twelve-reader-controller__speed-btn" data-rate="+25%" aria-pressed="false">1.25×</button>
+                            <button type="button" class="twelve-reader-controller__speed-btn" data-rate="+50%" aria-pressed="false">1.5×</button>
+                        </div>
+                    </div>
                 </div>
+                <button id="${CONTROLLER_PASTE_OPEN_ID}" type="button" class="twelve-reader-controller__paste-open">${controllerIcon("clipboard")}<span>Paste text to read</span></button>
+            </div>
+            <div class="twelve-reader-controller__paste">
+                <div class="twelve-reader-controller__paste-header">
+                    <span class="twelve-reader-controller__paste-label">Paste text</span>
+                    <button id="${CONTROLLER_PASTE_CLOSE_ID}" type="button" class="twelve-reader-controller__header-btn" aria-label="Close paste panel">&times;</button>
+                </div>
+                <div class="twelve-reader-controller__paste-body">
+                    <textarea id="${CONTROLLER_PASTE_INPUT_ID}" class="twelve-reader-controller__paste-textarea" rows="4" placeholder="Paste or type text to read..."></textarea>
+                    <div class="twelve-reader-controller__paste-actions">
+                        <button id="${CONTROLLER_PASTE_READ_ID}" type="button" class="twelve-reader-controller__paste-read">Read this text</button>
+                        <button id="${CONTROLLER_PASTE_CLEAR_ID}" type="button" class="twelve-reader-controller__paste-clear">Clear</button>
+                    </div>
+                </div>
+            </div>
+            <div class="twelve-reader-controller__pill">
+                <div id="${CONTROLLER_PILL_RING_ID}" class="twelve-reader-controller__pill-ring">
+                    <button id="${CONTROLLER_PILL_TOGGLE_ID}" type="button" class="twelve-reader-controller__pill-toggle" aria-label="Start reading">${controllerIcon("play")}</button>
+                </div>
+                <span id="${CONTROLLER_PILL_LABEL_ID}" class="twelve-reader-controller__pill-label">Cadence</span>
+                <button id="${CONTROLLER_EXPAND_ID}" type="button" class="twelve-reader-controller__header-btn" aria-label="Expand Cadence">${controllerIcon("chevronDown")}</button>
             </div>
         `;
 
-        controller.querySelector(`#${CONTROLLER_TOGGLE_ID}`).addEventListener("click", async () => {
-            try {
-                const response = await chrome.runtime.sendMessage({ type: "FLOATING_TOGGLE_PLAYBACK" });
-                if (!response || !response.ok) {
-                    throw new Error(response?.error || "Playback control failed.");
-                }
-                if (response.state) {
-                    applyReaderState(response.state);
-                }
-            } catch (error) {
-                showToast(error.message || "Playback control failed.");
+        const onToggleClick = () => {
+            if (controller.dataset.state === "idle") {
+                void handleStartReadingTop();
+            } else {
+                void handleTogglePlayback();
             }
-        });
-
-        controller.querySelector(`#${CONTROLLER_STOP_ID}`).addEventListener("click", async () => {
-            try {
-                const response = await chrome.runtime.sendMessage({ type: "FLOATING_STOP_READING" });
-                if (!response || !response.ok) {
-                    throw new Error(response?.error || "Stop failed.");
-                }
-                if (response.state) {
-                    applyReaderState(response.state);
-                }
-            } catch (error) {
-                showToast(error.message || "Stop failed.");
-            }
-        });
+        };
+        controller.querySelector(`#${CONTROLLER_TOGGLE_ID}`).addEventListener("click", onToggleClick);
+        controller.querySelector(`#${CONTROLLER_PILL_TOGGLE_ID}`).addEventListener("click", onToggleClick);
 
         controller.querySelector(`#${CONTROLLER_CLOSE_ID}`).addEventListener("click", async () => {
+            // Dismiss first: the stop round-trip broadcasts an idle state, which would otherwise re-show the standby pill.
+            state.dockDismissed = true;
+            state.dockPasteOpen = false;
+            hideFloatingController();
             try {
                 const response = await chrome.runtime.sendMessage({ type: "FLOATING_STOP_READING" });
                 if (!response || !response.ok) {
                     throw new Error(response?.error || "Terminate failed.");
                 }
-                hideFloatingController();
             } catch (error) {
+                state.dockDismissed = false;
+                updateFloatingController(state.readerState);
                 showToast(error.message || "Terminate failed.");
             }
+        });
+
+        controller.querySelector(`#${CONTROLLER_COLLAPSE_ID}`).addEventListener("click", () => {
+            state.dockCollapsed = true;
+            updateFloatingController(state.readerState);
+        });
+
+        controller.querySelector(`#${CONTROLLER_EXPAND_ID}`).addEventListener("click", () => {
+            state.dockCollapsed = false;
+            updateFloatingController(state.readerState);
         });
 
         controller.querySelector(`#${CONTROLLER_REWIND_ID}`).addEventListener("click", () => {
@@ -1439,8 +1751,12 @@
             syncFloatingControllerProgress(state.readerState);
         });
 
-        controller.querySelector(`#${CONTROLLER_SPEED_ID}`).addEventListener("change", async (event) => {
-            const nextRate = RATE_STEPS.includes(event.target.value) ? event.target.value : "+0%";
+        controller.querySelector(`#${CONTROLLER_SPEED_ID}`).addEventListener("click", async (event) => {
+            const button = event.target.closest("[data-rate]");
+            if (!button) {
+                return;
+            }
+            const nextRate = RATE_STEPS.includes(button.dataset.rate) ? button.dataset.rate : "+0%";
             await updateFloatingSetting({ rate: nextRate }, `Speed set to ${formatRateLabel(nextRate)}.`);
         });
 
@@ -1449,6 +1765,32 @@
                 return;
             }
             await updateFloatingSetting({ voiceName: event.target.value }, `Voice set to ${formatVoiceName(event.target.value)}.`);
+        });
+
+        controller.querySelector(`#${CONTROLLER_PASTE_OPEN_ID}`).addEventListener("click", () => {
+            openPastePanel(null);
+        });
+
+        controller.querySelector(`#${CONTROLLER_PASTE_CLOSE_ID}`).addEventListener("click", () => {
+            state.dockPasteOpen = false;
+            state.dockCollapsed = false;
+            updateFloatingController(state.readerState);
+        });
+
+        controller.querySelector(`#${CONTROLLER_PASTE_CLEAR_ID}`).addEventListener("click", () => {
+            const textarea = controller.querySelector(`#${CONTROLLER_PASTE_INPUT_ID}`);
+            textarea.value = "";
+            textarea.focus();
+        });
+
+        controller.querySelector(`#${CONTROLLER_PASTE_READ_ID}`).addEventListener("click", async () => {
+            const textarea = controller.querySelector(`#${CONTROLLER_PASTE_INPUT_ID}`);
+            const text = textarea.value.trim();
+            if (!text) {
+                showToast("Paste some text first.");
+                return;
+            }
+            await sendReadTextAction(text, "paste");
         });
 
         document.documentElement.appendChild(controller);
@@ -1486,53 +1828,44 @@
             }
 
             #${CONTROLLER_ID} {
+                --cd-font: system-ui, -apple-system, "Segoe UI", sans-serif;
+                --cd-serif: Georgia, "Times New Roman", serif;
+                --cd-text: #111827;
+                --cd-muted: #8a8f98;
+                --cd-idle-icon: #b2b8c2;
+                --cd-accent: #d9642e;
+                --cd-accent-strong: #b74e20;
+                --cd-surface: #ffffff;
+                --cd-field: #f6f7f9;
+                --cd-hover: #f3f4f6;
+                --cd-border: rgba(89, 102, 129, 0.14);
+                --cd-field-border: rgba(17, 24, 39, 0.08);
+                --cd-ink: #090909;
+                --cd-track: rgba(17, 17, 17, 0.12);
+                --cd-shadow-card: 0 24px 55px rgba(15, 23, 42, 0.18);
+                --cd-shadow-pill: 0 18px 40px rgba(15, 23, 42, 0.16);
+                --cd-shadow-play: 0 14px 22px rgba(17, 17, 17, 0.18);
+
                 position: fixed;
-                left: 50%;
-                bottom: 16px;
-                width: min(1880px, calc(100vw - 32px));
-                display: grid;
-                grid-template-columns: minmax(260px, 1.2fr) minmax(360px, 1.6fr) auto;
-                align-items: center;
-                gap: 30px;
-                padding: 26px 32px;
-                border: 1px solid rgba(89, 102, 129, 0.14);
-                border-radius: 28px;
-                background: rgba(255, 255, 255, 0.98);
-                color: #111827;
-                box-shadow: 0 24px 55px rgba(15, 23, 42, 0.16);
-                backdrop-filter: blur(18px);
+                right: 20px;
+                bottom: 20px;
                 z-index: 2147483647;
-                opacity: 0;
-                transform: translate(-50%, 28px);
-                transition: opacity 180ms ease, transform 180ms ease;
-                font: 500 14px/1.4 Inter, "Segoe UI", Arial, sans-serif;
-                box-sizing: border-box;
+                width: 332px;
+                max-width: calc(100vw - 32px);
+                max-height: calc(100vh - 40px);
+                display: flex;
+                flex-direction: column;
+                border-radius: 24px;
+                background: rgba(255, 255, 255, 0.98);
+                border: 1px solid var(--cd-border);
+                box-shadow: var(--cd-shadow-card);
+                color: var(--cd-text);
+                font: 500 14px/1.4 var(--cd-font);
+                overflow: hidden;
             }
 
-            .twelve-reader-controller__close {
-                position: absolute;
-                top: 12px;
-                right: 12px;
-                width: 34px;
-                height: 34px;
-                border: 0;
-                border-radius: 999px;
-                background: transparent;
-                color: #8a8f98;
-                font: 500 24px/1 Inter, "Segoe UI", Arial, sans-serif;
-                cursor: pointer;
-                transition: background 160ms ease, color 160ms ease, transform 160ms ease;
-            }
-
-            .twelve-reader-controller__close:hover {
-                background: #f3f4f6;
-                color: #111827;
-                transform: translateY(-1px);
-            }
-
-            .twelve-reader-controller__close:focus {
-                outline: none;
-                box-shadow: 0 0 0 3px rgba(17, 24, 39, 0.08);
+            #${CONTROLLER_ID}[hidden] {
+                display: none;
             }
 
             #${CONTROLLER_ID},
@@ -1540,62 +1873,123 @@
                 box-sizing: border-box;
             }
 
-            #${CONTROLLER_ID}[data-visible="true"] {
-                opacity: 1;
-                transform: translate(-50%, 0);
+            #${CONTROLLER_ID} button,
+            #${CONTROLLER_ID} select,
+            #${CONTROLLER_ID} textarea {
+                font-family: var(--cd-font);
             }
 
-            .twelve-reader-controller__artifact {
+            #${CONTROLLER_ID} svg {
+                fill: currentColor;
+                pointer-events: none;
+            }
+
+            #${CONTROLLER_ID} button:focus-visible,
+            #${CONTROLLER_ID} select:focus-visible,
+            #${CONTROLLER_ID} textarea:focus-visible,
+            #${CONTROLLER_ID} input:focus-visible {
+                outline: 2px solid var(--cd-accent);
+                outline-offset: 2px;
+            }
+
+            .twelve-reader-controller__header {
                 display: flex;
                 align-items: center;
-                gap: 22px;
-                min-width: 0;
+                justify-content: space-between;
+                gap: 8px;
+                padding: 14px 16px;
+                border-bottom: 1px solid var(--cd-border);
+                flex-shrink: 0;
             }
 
-            .twelve-reader-controller__cover {
+            .twelve-reader-controller__status {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 0.1em;
+                text-transform: uppercase;
+                color: var(--cd-muted);
+            }
+
+            .twelve-reader-controller__status::before {
+                content: "";
+                width: 6px;
+                height: 6px;
+                border-radius: 999px;
+                background: currentColor;
+                flex-shrink: 0;
+            }
+
+            #${CONTROLLER_ID}[data-state="reading"] .twelve-reader-controller__status {
+                color: var(--cd-accent-strong);
+            }
+
+            #${CONTROLLER_ID}[data-state="reading"] .twelve-reader-controller__status::before {
+                animation: cadence-pulse 1.6s ease-in-out infinite;
+            }
+
+            @keyframes cadence-pulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.35; }
+            }
+
+            .twelve-reader-controller__header-actions {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+            }
+
+            .twelve-reader-controller__header-btn {
+                appearance: none;
+                width: 32px;
+                height: 32px;
+                border: 0;
+                border-radius: 999px;
+                background: transparent;
+                color: var(--cd-muted);
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
-                gap: 4px;
-                width: 76px;
-                height: 76px;
-                border-radius: 8px;
-                background: linear-gradient(180deg, #fbfbfc 0%, #eef2f7 100%);
-                border: 1px solid rgba(17, 24, 39, 0.06);
-                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+                font: 500 20px/1 var(--cd-font);
+                cursor: pointer;
+                transition: background 160ms ease, color 160ms ease;
             }
 
-            .twelve-reader-controller__cover span {
-                width: 4px;
-                border-radius: 999px;
-                background: linear-gradient(180deg, #c7cfdd 0%, #99a9c3 100%);
+            .twelve-reader-controller__header-btn svg {
+                width: 18px;
+                height: 18px;
             }
 
-            .twelve-reader-controller__cover span:nth-child(1) {
-                height: 16px;
+            .twelve-reader-controller__header-btn:hover {
+                background: var(--cd-hover);
+                color: var(--cd-text);
             }
 
-            .twelve-reader-controller__cover span:nth-child(2) {
-                height: 28px;
+            .twelve-reader-controller__body {
+                display: flex;
+                flex-direction: column;
+                flex: 1 1 auto;
+                min-height: 0;
+                padding: 18px 16px 16px;
+                overflow-y: auto;
             }
 
-            .twelve-reader-controller__cover span:nth-child(3) {
-                height: 22px;
-            }
-
-            .twelve-reader-controller__cover span:nth-child(4) {
-                height: 12px;
+            #${CONTROLLER_ID}[data-mode="paste"] .twelve-reader-controller__body {
+                display: none;
             }
 
             .twelve-reader-controller__meta {
                 display: flex;
                 flex-direction: column;
-                gap: 6px;
+                gap: 4px;
                 min-width: 0;
+                margin-bottom: 16px;
             }
 
             .twelve-reader-controller__title {
-                font: 700 22px/1.12 Georgia, "Times New Roman", serif;
+                font: 700 19px/1.2 var(--cd-serif);
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
@@ -1603,39 +1997,18 @@
 
             .twelve-reader-controller__subtitle {
                 font-size: 12px;
-                font-weight: 700;
-                letter-spacing: 0.1em;
-                text-transform: uppercase;
-                color: #8a8f98;
+                color: var(--cd-muted);
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
             }
 
-            .twelve-reader-controller__sr-only {
-                position: absolute;
-                width: 1px;
-                height: 1px;
-                padding: 0;
-                margin: -1px;
-                overflow: hidden;
-                clip: rect(0, 0, 0, 0);
-                white-space: nowrap;
-                border: 0;
-            }
-
-            .twelve-reader-controller__transport {
-                display: flex;
-                flex-direction: column;
-                gap: 18px;
-                min-width: 0;
-            }
-
-            .twelve-reader-controller__actions {
+            .twelve-reader-controller__transport-row {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                gap: 18px;
+                gap: 10px;
+                margin-bottom: 16px;
             }
 
             .twelve-reader-controller__icon-button,
@@ -1647,7 +2020,7 @@
                 align-items: center;
                 justify-content: center;
                 cursor: pointer;
-                transition: transform 160ms ease, background 160ms ease, color 160ms ease, box-shadow 160ms ease, opacity 160ms ease;
+                transition: transform 160ms ease, background 160ms ease, color 160ms ease, opacity 160ms ease;
             }
 
             .twelve-reader-controller__icon-button {
@@ -1655,59 +2028,55 @@
                 height: 42px;
                 border-radius: 999px;
                 background: transparent;
-                color: #b2b8c2;
+                color: var(--cd-idle-icon);
             }
 
-            .twelve-reader-controller__icon-button svg,
-            .twelve-reader-controller__play-button svg {
-                width: 22px;
-                height: 22px;
-                fill: currentColor;
+            .twelve-reader-controller__icon-button svg {
+                width: 20px;
+                height: 20px;
             }
 
             .twelve-reader-controller__icon-button:hover:not(:disabled) {
-                background: #f3f4f6;
-                color: #111827;
-                transform: translateY(-1px);
+                background: var(--cd-hover);
+                color: var(--cd-text);
             }
 
             .twelve-reader-controller__icon-button:disabled,
             .twelve-reader-controller__play-button:disabled {
-                opacity: 0.55;
+                opacity: 0.45;
                 cursor: default;
                 transform: none;
-                box-shadow: none;
             }
 
             .twelve-reader-controller__play-button {
-                width: 76px;
-                height: 76px;
-                border-radius: 6px;
-                background: #090909;
+                width: 62px;
+                height: 62px;
+                border-radius: 22px;
+                background: var(--cd-ink);
                 color: #ffffff;
-                box-shadow: 0 18px 26px rgba(17, 17, 17, 0.18);
+                box-shadow: var(--cd-shadow-play);
             }
 
             .twelve-reader-controller__play-button svg {
-                width: 30px;
-                height: 30px;
+                width: 26px;
+                height: 26px;
             }
 
             .twelve-reader-controller__play-button:hover:not(:disabled) {
                 background: #000000;
-                transform: translateY(-1px);
             }
 
             .twelve-reader-controller__timeline {
                 display: grid;
                 grid-template-columns: auto minmax(0, 1fr) auto;
                 align-items: center;
-                gap: 16px;
+                gap: 10px;
+                margin-bottom: 16px;
             }
 
             .twelve-reader-controller__time {
-                font-size: 12px;
-                color: #8a8f98;
+                font-size: 11px;
+                color: var(--cd-muted);
                 font-variant-numeric: tabular-nums;
                 white-space: nowrap;
             }
@@ -1715,7 +2084,7 @@
             .twelve-reader-controller__seek {
                 --twelve-reader-progress: 0%;
                 width: 100%;
-                height: 24px;
+                height: 20px;
                 margin: 0;
                 background: transparent;
                 cursor: pointer;
@@ -1729,12 +2098,12 @@
 
             .twelve-reader-controller__seek:disabled {
                 cursor: default;
-                opacity: 0.55;
+                opacity: 0.5;
             }
 
             .twelve-reader-controller__seek::-webkit-slider-runnable-track {
                 height: 2px;
-                background: linear-gradient(to right, #111111 0%, #111111 var(--twelve-reader-progress), rgba(17, 17, 17, 0.12) var(--twelve-reader-progress), rgba(17, 17, 17, 0.12) 100%);
+                background: linear-gradient(to right, var(--cd-accent) 0%, var(--cd-accent) var(--twelve-reader-progress), var(--cd-track) var(--twelve-reader-progress), var(--cd-track) 100%);
             }
 
             .twelve-reader-controller__seek::-webkit-slider-thumb {
@@ -1751,12 +2120,12 @@
 
             .twelve-reader-controller__seek::-moz-range-track {
                 height: 2px;
-                background: rgba(17, 17, 17, 0.12);
+                background: var(--cd-track);
             }
 
             .twelve-reader-controller__seek::-moz-range-progress {
                 height: 2px;
-                background: #111111;
+                background: var(--cd-accent);
             }
 
             .twelve-reader-controller__seek::-moz-range-thumb {
@@ -1769,10 +2138,9 @@
             }
 
             .twelve-reader-controller__settings {
-                display: flex;
-                align-items: center;
-                gap: 34px;
-                justify-self: end;
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 12px;
             }
 
             .twelve-reader-controller__setting {
@@ -1783,146 +2151,262 @@
             }
 
             .twelve-reader-controller__setting-label {
-                font-size: 12px;
+                font-size: 11px;
                 font-weight: 700;
                 letter-spacing: 0.1em;
                 text-transform: uppercase;
-                color: #8a8f98;
+                color: var(--cd-muted);
             }
 
-            .twelve-reader-controller__setting-input-wrap {
-                position: relative;
-                min-width: 116px;
-            }
-
-            .twelve-reader-controller__setting-input-wrap--voice {
-                min-width: 168px;
-                max-width: 220px;
-            }
-
-            .twelve-reader-controller__setting-input-wrap::after {
-                content: "";
-                position: absolute;
-                top: 50%;
-                right: 14px;
-                width: 7px;
-                height: 7px;
-                border-right: 1.5px solid #7a818d;
-                border-bottom: 1.5px solid #7a818d;
-                transform: translateY(-65%) rotate(45deg);
-                pointer-events: none;
-            }
-
-            .twelve-reader-controller__setting-select {
-                width: 100%;
+            .twelve-reader-controller__voice-select {
                 min-height: 40px;
-                padding: 0 34px 0 12px;
-                border: 1px solid rgba(17, 24, 39, 0.08);
-                border-radius: 4px;
-                background: #f6f7f9;
-                color: #111827;
-                font: 700 15px/1.2 Inter, "Segoe UI", Arial, sans-serif;
+                padding: 0 32px 0 12px;
+                border: 1px solid var(--cd-field-border);
+                border-radius: 999px;
+                background-color: var(--cd-field);
+                background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%237a818d' d='M6 10l6 6 6-6z'/%3E%3C/svg%3E");
+                background-repeat: no-repeat;
+                background-position: right 10px center;
+                background-size: 14px;
+                color: var(--cd-text);
+                font: 700 14px/1.2 var(--cd-font);
                 appearance: none;
                 -webkit-appearance: none;
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
-                transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
+                transition: border-color 160ms ease, background-color 160ms ease;
             }
 
-            .twelve-reader-controller__setting-select:hover:not(:disabled) {
+            .twelve-reader-controller__voice-select:hover:not(:disabled) {
                 border-color: rgba(17, 24, 39, 0.16);
-                background: #f3f4f6;
             }
 
-            .twelve-reader-controller__setting-select:focus {
-                outline: none;
-                border-color: rgba(17, 24, 39, 0.22);
-                box-shadow: 0 0 0 3px rgba(17, 24, 39, 0.08);
-            }
-
-            .twelve-reader-controller__setting-select:disabled {
+            .twelve-reader-controller__voice-select:disabled {
                 cursor: default;
                 opacity: 0.7;
             }
 
-            @media (max-width: 1180px) {
-                #${CONTROLLER_ID} {
-                    grid-template-columns: 1fr;
-                    gap: 18px;
-                    padding: 20px;
-                }
-
-                .twelve-reader-controller__artifact,
-                .twelve-reader-controller__settings {
-                    justify-self: stretch;
-                }
-
-                .twelve-reader-controller__actions {
-                    justify-content: flex-start;
-                }
-
-                .twelve-reader-controller__settings {
-                    justify-content: space-between;
-                    gap: 16px;
-                }
+            .twelve-reader-controller__speed {
+                display: flex;
+                padding: 3px;
+                border-radius: 999px;
+                background: var(--cd-field);
+                border: 1px solid var(--cd-field-border);
             }
 
-            @media (max-width: 720px) {
-                #${CONTROLLER_ID} {
-                    width: calc(100vw - 20px);
-                    bottom: 10px;
-                    padding: 18px 16px;
-                    border-radius: 22px;
-                }
+            .twelve-reader-controller__speed-btn {
+                appearance: none;
+                flex: 1;
+                height: 34px;
+                border: 0;
+                border-radius: 999px;
+                background: transparent;
+                color: var(--cd-muted);
+                font-size: 12px;
+                font-weight: 700;
+                cursor: pointer;
+                transition: background 160ms ease, color 160ms ease;
+            }
 
-                .twelve-reader-controller__artifact {
-                    align-items: flex-start;
-                }
+            .twelve-reader-controller__speed-btn[aria-pressed="true"] {
+                background: var(--cd-accent);
+                color: #ffffff;
+            }
 
-                .twelve-reader-controller__cover {
-                    width: 60px;
-                    height: 60px;
-                    border-radius: 8px;
-                }
+            .twelve-reader-controller__paste-open {
+                appearance: none;
+                width: 100%;
+                min-height: 44px;
+                margin-top: 14px;
+                border: 1px dashed rgba(17, 24, 39, 0.22);
+                border-radius: 14px;
+                background: transparent;
+                color: var(--cd-muted);
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 0.14em;
+                text-transform: uppercase;
+                cursor: pointer;
+                transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
+            }
 
-                .twelve-reader-controller__title {
-                    font-size: 18px;
-                }
+            .twelve-reader-controller__paste-open svg {
+                width: 16px;
+                height: 16px;
+            }
 
-                .twelve-reader-controller__actions {
-                    gap: 10px;
-                    flex-wrap: wrap;
-                }
+            .twelve-reader-controller__paste-open:hover {
+                background: var(--cd-field);
+                border-color: var(--cd-accent);
+                color: var(--cd-accent-strong);
+            }
 
-                .twelve-reader-controller__icon-button {
-                    width: 38px;
-                    height: 38px;
-                }
+            .twelve-reader-controller__paste {
+                display: none;
+                flex-direction: column;
+                flex: 1 1 auto;
+                min-height: 0;
+                overflow-y: auto;
+            }
 
-                .twelve-reader-controller__play-button {
-                    width: 64px;
-                    height: 64px;
-                }
+            #${CONTROLLER_ID}[data-mode="paste"] .twelve-reader-controller__paste {
+                display: flex;
+            }
 
-                .twelve-reader-controller__timeline {
-                    grid-template-columns: 1fr;
-                    gap: 10px;
-                }
+            .twelve-reader-controller__paste-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 12px 16px;
+                border-bottom: 1px solid var(--cd-border);
+                flex-shrink: 0;
+            }
 
-                .twelve-reader-controller__time:last-child {
-                    justify-self: end;
-                }
+            .twelve-reader-controller__paste-label {
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 0.1em;
+                text-transform: uppercase;
+                color: var(--cd-muted);
+            }
 
-                .twelve-reader-controller__settings {
-                    flex-direction: column;
-                    align-items: flex-start;
-                }
+            .twelve-reader-controller__paste-body {
+                display: flex;
+                flex-direction: column;
+                padding: 14px 16px 16px;
+                gap: 8px;
+            }
 
-                .twelve-reader-controller__setting-input-wrap,
-                .twelve-reader-controller__setting-input-wrap--voice {
-                    min-width: min(220px, calc(100vw - 72px));
-                    max-width: none;
+            .twelve-reader-controller__paste-textarea {
+                padding: 12px 14px;
+                border: 1px solid rgba(17, 24, 39, 0.12);
+                border-radius: 14px;
+                background: var(--cd-field);
+                color: var(--cd-text);
+                font: 14px/1.6 var(--cd-serif);
+                resize: vertical;
+            }
+
+            .twelve-reader-controller__paste-actions {
+                display: grid;
+                grid-template-columns: 1fr auto;
+                gap: 8px;
+            }
+
+            .twelve-reader-controller__paste-read,
+            .twelve-reader-controller__paste-clear {
+                appearance: none;
+                min-height: 44px;
+                border-radius: 14px;
+                padding: 0 18px;
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 0.14em;
+                text-transform: uppercase;
+                cursor: pointer;
+                transition: background 160ms ease;
+            }
+
+            .twelve-reader-controller__paste-read {
+                border: 0;
+                background: var(--cd-accent);
+                color: #ffffff;
+            }
+
+            .twelve-reader-controller__paste-read:hover {
+                background: var(--cd-accent-strong);
+            }
+
+            .twelve-reader-controller__paste-clear {
+                border: 1px solid var(--cd-field-border);
+                background: var(--cd-field);
+                color: var(--cd-text);
+            }
+
+            .twelve-reader-controller__pill {
+                display: none;
+                align-items: center;
+                gap: 12px;
+                height: 56px;
+                padding: 0 8px;
+                border-radius: 999px;
+                background: rgba(255, 255, 255, 0.98);
+                border: 1px solid var(--cd-border);
+                box-shadow: var(--cd-shadow-pill);
+            }
+
+            #${CONTROLLER_ID}[data-mode="collapsed"] {
+                background: transparent;
+                border: 0;
+                box-shadow: none;
+                width: auto;
+                max-height: none;
+                overflow: visible;
+            }
+
+            #${CONTROLLER_ID}[data-mode="collapsed"] .twelve-reader-controller__header,
+            #${CONTROLLER_ID}[data-mode="collapsed"] .twelve-reader-controller__body,
+            #${CONTROLLER_ID}[data-mode="collapsed"] .twelve-reader-controller__paste {
+                display: none;
+            }
+
+            #${CONTROLLER_ID}[data-mode="collapsed"] .twelve-reader-controller__pill {
+                display: flex;
+            }
+
+            .twelve-reader-controller__pill-ring {
+                --cd-ring: 0%;
+                position: relative;
+                width: 40px;
+                height: 40px;
+                border-radius: 999px;
+                flex-shrink: 0;
+                background: conic-gradient(var(--cd-accent) 0 var(--cd-ring), rgba(17, 17, 17, 0.10) var(--cd-ring) 100%);
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .twelve-reader-controller__pill-toggle {
+                appearance: none;
+                width: 32px;
+                height: 32px;
+                border: 0;
+                border-radius: 999px;
+                background: var(--cd-ink);
+                color: #ffffff;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
+            }
+
+            .twelve-reader-controller__pill-toggle svg {
+                width: 16px;
+                height: 16px;
+            }
+
+            .twelve-reader-controller__pill-label {
+                flex: 1;
+                min-width: 0;
+                font-size: 12px;
+                font-weight: 700;
+                font-variant-numeric: tabular-nums;
+                color: var(--cd-text);
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            @media (prefers-reduced-motion: reduce) {
+                #${CONTROLLER_ID} * {
+                    transition: none !important;
+                    animation: none !important;
                 }
             }
 

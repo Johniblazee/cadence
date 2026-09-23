@@ -10,6 +10,7 @@ const DEFAULT_SETTINGS = {
     clickMode: false
 };
 const VALID_RATES = new Set(["-25%", "+0%", "+25%", "+50%"]);
+const VALID_SOURCE_KINDS = new Set(["page", "paste", "selection"]);
 
 const tabStates = new Map();
 let activeSpeechTabId = null;
@@ -19,11 +20,23 @@ let offscreenCreation = null;
 chrome.runtime.onInstalled.addListener(async () => {
     const stored = await storageLocalGet(DEFAULT_SETTINGS);
     await storageLocalSet({ ...DEFAULT_SETTINGS, ...stored });
+
+    await chrome.contextMenus.removeAll();
+    chrome.contextMenus.create({ id: "cadence", title: "Cadence", contexts: ["page", "selection"] });
+    chrome.contextMenus.create({ id: "cadence-read-from-here", parentId: "cadence", title: "Read from here", contexts: ["page", "selection"] });
+    chrome.contextMenus.create({ id: "cadence-continue-from-here", parentId: "cadence", title: "Continue from here", contexts: ["page", "selection"], visible: false });
+    chrome.contextMenus.create({ id: "cadence-read-selection", parentId: "cadence", title: "Read selection only", contexts: ["selection"] });
+    chrome.contextMenus.create({ id: "cadence-send-to-paste", parentId: "cadence", title: "Send to paste box", contexts: ["selection"] });
 });
 
 
 chrome.tabs.onRemoved.addListener((tabId) => {
     void cleanupRemovedTab(tabId);
+});
+
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+    void handleContextMenuClick(info, tab);
 });
 
 
@@ -82,6 +95,19 @@ async function handleMessage(message, sender) {
             await setDocumentText(tabId, message.text || "");
             await startSpeech(tabId, Number(message.offset) || 0, { autoplay: true });
             return { state: await getSerializableState(tabId) };
+
+        case "READ_TEXT": {
+            if (!tabId) {
+                throw new Error("No tab available.");
+            }
+            const text = typeof message.text === "string" ? message.text : "";
+            if (!text.trim()) {
+                throw new Error("Nothing to read.");
+            }
+            await setDocumentText(tabId, text, message.source === "selection" ? "selection" : "paste");
+            await startSpeech(tabId, 0, { autoplay: true });
+            return { state: await getSerializableState(tabId) };
+        }
 
         case "PAUSE_READING":
             if (!tabId) {
@@ -185,6 +211,46 @@ async function togglePlayback(tabId) {
 }
 
 
+const CONTEXT_MENU_ACTIONS = {
+    "cadence-read-from-here": "read-from-here",
+    "cadence-continue-from-here": "continue-from-here",
+    "cadence-read-selection": "read-selection",
+    "cadence-send-to-paste": "send-to-paste"
+};
+
+
+async function handleContextMenuClick(info, tab) {
+    if (!tab?.id) {
+        return;
+    }
+
+    const action = CONTEXT_MENU_ACTIONS[info.menuItemId];
+    if (!action) {
+        return;
+    }
+
+    try {
+        await ensureContentScriptReady(tab.id);
+        await sendMessageToTab(tab.id, {
+            type: "CONTEXT_MENU_ACTION",
+            action,
+            selectionText: info.selectionText || ""
+        });
+    } catch (error) {
+        // page not injectable; nothing to surface
+    }
+}
+
+
+async function updateContinueMenuVisibility(visible) {
+    try {
+        await chrome.contextMenus.update("cadence-continue-from-here", { visible });
+    } catch (error) {
+        // menu not created yet
+    }
+}
+
+
 async function getActiveTab() {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     return tabs[0] || null;
@@ -239,7 +305,9 @@ async function getSerializableState(tabId) {
         voiceName: state.settings.voiceName,
         rate: state.settings.rate,
         lastError: state.lastError || "",
-        isActiveTab: activeSpeechTabId === tabId
+        isActiveTab: activeSpeechTabId === tabId,
+        sourceKind: state.sourceKind || "page",
+        textLength: (state.text || "").length
     };
 }
 
@@ -352,11 +420,12 @@ async function refreshDocumentText(tabId) {
 }
 
 
-async function setDocumentText(tabId, text) {
+async function setDocumentText(tabId, text, sourceKind = "page") {
     const state = await ensureTabState(tabId);
     state.text = text || "";
     state.currentOffset = clamp(state.currentOffset, 0, state.text.length);
     state.lastError = "";
+    state.sourceKind = VALID_SOURCE_KINDS.has(sourceKind) ? sourceKind : "page";
     await persistTabState(tabId, state);
 }
 
@@ -809,6 +878,8 @@ function absoluteBackendUrl(path, backendBaseUrl) {
 
 async function broadcastState(tabId) {
     const state = await getSerializableState(tabId);
+    void updateContinueMenuVisibility(Boolean(state.isSpeaking || state.isPaused));
+
     const payload = {
         type: "STATE_UPDATED",
         state
@@ -879,7 +950,8 @@ function createInitialState(settings) {
         isSpeaking: false,
         isPaused: false,
         pendingRestart: false,
-        lastError: ""
+        lastError: "",
+        sourceKind: "page"
     };
 }
 
@@ -898,7 +970,8 @@ function hydrateStoredState(storedState, settings) {
         isSpeaking: Boolean(storedState.isSpeaking),
         isPaused: Boolean(storedState.isPaused),
         pendingRestart: Boolean(storedState.pendingRestart),
-        lastError: typeof storedState.lastError === "string" ? storedState.lastError : ""
+        lastError: typeof storedState.lastError === "string" ? storedState.lastError : "",
+        sourceKind: VALID_SOURCE_KINDS.has(storedState.sourceKind) ? storedState.sourceKind : "page"
     };
 }
 
@@ -915,7 +988,8 @@ function serializeTabState(state) {
         isSpeaking: state.isSpeaking,
         isPaused: state.isPaused,
         pendingRestart: state.pendingRestart,
-        lastError: state.lastError
+        lastError: state.lastError,
+        sourceKind: state.sourceKind
     };
 }
 
